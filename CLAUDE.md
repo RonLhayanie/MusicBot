@@ -1,5 +1,9 @@
 # MusicBot
 
+# Developer Context
+Always read my personal context file before making suggestions or writing code, located at:
+C:\Users\ronlh\OneDrive\מסמכים\Claude presonal\ron_context.md
+
 ## Overview
 A personal Telegram + Siri voice assistant for discovering and saving music to Spotify. A user sends a free-text message (or a voice command via an iOS Shortcut) describing what they want to hear — including associative/historical requests like "50s blues that influenced Jimi Hendrix" — and Gemini acts as a music historian/curator to return real, verifiable songs, which the user can then inject straight into their Spotify library with one tap.
 
