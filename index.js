@@ -5,6 +5,7 @@ const express = require('express');
 const querystring = require('querystring');
 const axios = require('axios');
 const mongoose = require('mongoose');
+const cron = require('node-cron');
 
 // Setup from .env
 const token = process.env.TELEGRAM_TOKEN;
@@ -14,6 +15,14 @@ const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
 const SPOTIFY_REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI;
 const SPOTIFY_REFRESH_TOKEN = process.env.SPOTIFY_REFRESH_TOKEN;
 const MONGO_URI = process.env.MONGO_URI;
+// Optional but recommended: locks dashboard notifications to one specific Telegram chat
+// so no other chat that messages the bot can silently steal the notification destination.
+// If unset, falls back to a "claim once" scheme (see bot.on('message') below) — safer than
+// an unconditional overwrite, but has a bootstrap race on a brand-new deploy (whoever
+// messages first wins). Set this in Railway's env vars for full protection.
+const TELEGRAM_OWNER_CHAT_ID = process.env.TELEGRAM_OWNER_CHAT_ID
+    ? Number(process.env.TELEGRAM_OWNER_CHAT_ID)
+    : null;
 
 // polling/listening are only started once MongoDB connects successfully (see start() below) —
 // Railway's filesystem is ephemeral, so this app should not accept traffic without its DB
@@ -21,6 +30,14 @@ const bot = new TelegramBot(token, { polling: false });
 const app = express();
 app.use(express.json()); // required to receive JSON commands from the iOS Siri Shortcut
 const PORT = 8888;
+
+// Defense-in-depth: modern Node terminates the process on an unhandled rejection by
+// default. pushDashboardUpdate/getDashboardChatId are hardened not to reject at all, but
+// this is a last-resort net for anything else in the background-processing paths that
+// isn't awaited — a Railway deploy shouldn't go down over one uncaught async error.
+process.on('unhandledRejection', (reason) => {
+    console.error("Unhandled promise rejection (recovered):", reason);
+});
 
 console.log("Music bot is on air");
 
@@ -200,12 +217,28 @@ async function resumePlaybackOnDevice(accessToken, deviceId) {
     });
 }
 
-// Returns true if Spotify is currently playing on any device, false if paused/stopped/no session
-async function isCurrentlyPlaying(accessToken) {
+// Single /me/player call returning both the active device and play state — Spotify's
+// response already has both, so callers needing both don't need two separate requests.
+async function getPlaybackState(accessToken) {
     const response = await axios.get('https://api.spotify.com/v1/me/player', {
         headers: { 'Authorization': `Bearer ${accessToken}` }
     }).catch(() => null);
-    return Boolean(response?.data?.is_playing);
+    return {
+        device: response?.data?.device ?? null,
+        isPlaying: Boolean(response?.data?.is_playing)
+    };
+}
+
+// Returns the full Spotify track object for whatever's currently playing, or null if
+// nothing is (204 No Content) OR if what's playing isn't a track (podcast episode/ad —
+// those have no .artists array, so treating them as a track crashes the caller).
+async function getCurrentlyPlayingTrack(accessToken) {
+    const response = await axios.get('https://api.spotify.com/v1/me/player/currently-playing', {
+        headers: { 'Authorization': `Bearer ${accessToken}` }
+    });
+    if (response.status === 204 || !response.data?.item) return null;
+    if (response.data.currently_playing_type !== 'track') return null;
+    return response.data.item;
 }
 
 // Finds an active device and plays a track there. Returns the device on success,
@@ -237,20 +270,31 @@ let currentSession = null;
 // Telegram messages (see bot.on('message') below) since the Siri webhook has no chat
 // context of its own. Always read fresh from Mongo (not cached in-memory) so this stays
 // correct regardless of process restarts or which code path is asking.
+// Never throws/rejects — every call site below fires this without awaiting it, so it
+// must swallow its own failures (Mongo hiccup, Telegram send failure) rather than
+// leave an unhandled rejection that could crash the whole process.
 async function getDashboardChatId() {
-    const config = await BotConfig.findById('singleton');
-    return config?.dashboardChatId ?? null;
+    try {
+        const config = await BotConfig.findById('singleton');
+        return config?.dashboardChatId ?? null;
+    } catch (err) {
+        console.error("Failed to read dashboard chat ID:", err.message);
+        return null;
+    }
 }
 
 async function pushDashboardUpdate(text) {
-    const chatId = await getDashboardChatId();
-    if (!chatId) {
-        console.log(`Dashboard push skipped (no chat ID known yet): ${text}`);
-        return;
+    try {
+        const chatId = await getDashboardChatId();
+        if (!chatId) {
+            console.log(`Dashboard push skipped (no chat ID known yet): ${text}`);
+            return;
+        }
+        await bot.sendMessage(chatId, text);
+        console.log(`Dashboard push sent: ${text}`);
+    } catch (err) {
+        console.error("Dashboard push failed:", err.message);
     }
-    bot.sendMessage(chatId, text)
-        .then(() => console.log(`Dashboard push sent: ${text}`))
-        .catch(err => console.error("Dashboard push failed:", err.message));
 }
 
 // Logs an interaction to MongoDB (survives redeploys, unlike the old in-memory version)
@@ -286,30 +330,39 @@ function sendTrackCard(chatId, track, title, artist) {
 // Sends each song as a track card (search → resolve → card + buttons). Songs that can't
 // be resolved on Spotify get a visible "not found" line. Used by the free-text research
 // flow, where every one of the (up to 5) researched songs is expected to be shown.
+// Searches run concurrently (independent of each other) — sequentially, up to 5 songs
+// each needing up to 2 Spotify calls added several seconds of avoidable latency; cards are
+// still sent in the original research order regardless of which search resolves first.
 async function sendTrackCards(chatId, songs, accessToken) {
-    for (const song of songs) {
-        const track = await searchSpotifyTrack(accessToken, song.title, song.artist).catch(() => null);
+    const tracks = await Promise.all(
+        songs.map(song => searchSpotifyTrack(accessToken, song.title, song.artist).catch(() => null))
+    );
 
+    songs.forEach((song, i) => {
+        const track = tracks[i];
         if (!track) {
             bot.sendMessage(chatId, `🎵 ${song.title} - ${song.artist} (לא נמצא בספוטיפיי)`);
-            continue;
+            return;
         }
-
         sendTrackCard(chatId, track, song.title, song.artist);
-    }
+    });
 }
 
-// Resolves candidate songs against Spotify one at a time, sending a card for each match
-// and silently skipping ones that don't resolve, until `limit` cards have been sent.
-// Used by the recommendations flow, which over-fetches candidates precisely because some
-// won't resolve — the user should just see a clean set of playable results, not misses.
+// Resolves candidate songs against Spotify concurrently, sending a card for the first
+// `limit` matches and silently skipping ones that don't resolve. Used by the
+// recommendations flow, which over-fetches candidates (5-6) precisely because some won't
+// resolve — the user should just see a clean set of playable results, not misses. The
+// candidate pool is always small and bounded, so resolving all of them concurrently is
+// simpler and faster overall than a sequential early-exit that stops once `limit` is hit.
 async function sendAvailableTrackCards(chatId, songs, accessToken, limit) {
+    const tracks = await Promise.all(
+        songs.map(song => searchSpotifyTrack(accessToken, song.title, song.artist).catch(() => null))
+    );
+
     let sentCount = 0;
-    for (const song of songs) {
-        if (sentCount >= limit) break;
-        const track = await searchSpotifyTrack(accessToken, song.title, song.artist).catch(() => null);
-        if (!track) continue;
-        sendTrackCard(chatId, track, song.title, song.artist);
+    for (let i = 0; i < songs.length && sentCount < limit; i++) {
+        if (!tracks[i]) continue;
+        sendTrackCard(chatId, tracks[i], songs[i].title, songs[i].artist);
         sentCount++;
     }
     return sentCount;
@@ -331,14 +384,15 @@ async function advanceSession(accessToken) {
         : `לא מצאתי מכשיר ספוטיפיי פעיל להמשך הפלייליסט.`;
 }
 
-// Saves the current session track to Liked Songs (playlist-content mutation is 403'd
-// by Spotify's Development Mode restrictions), then advances to the next one.
+// Caller (processSiriCommand) is responsible for pushing the returned text to Telegram —
+// this function doesn't push its own partial update, so a failure partway through (e.g.
+// the save succeeds but advancing to the next track fails) still gets exactly one
+// notification instead of a silent gap.
 async function addCurrentTrackToSession(accessToken) {
     const track = currentSession.tracks[currentSession.currentIndex];
     await saveTrackToLibrary(accessToken, track.trackId);
     console.log(`Saved "${track.title}" to Liked Songs.`);
-    logInteraction('added', track.trackId, track.title, track.artist);
-    pushDashboardUpdate(`✅ נוסף ל-Liked Songs: ${track.title} - ${track.artist}`);
+    await logInteraction('added', track.trackId, track.title, track.artist);
     const advanceMsg = await advanceSession(accessToken);
     return `✅ נוסף "${track.title}"! ${advanceMsg}`;
 }
@@ -406,10 +460,14 @@ async function callGeminiForSongs(prompt, retries = 3, delay = 2000) {
                 return { error: "quota" };
             }
 
-            // Retry on anything else transient — not just 503/429. Errors without a clean
-            // HTTP status (network blips, truncated-JSON parse failures) were previously
-            // falling through to an immediate failure on the very first attempt.
-            if (i < retries - 1) {
+            // Retry only on conditions actually likely to resolve on their own: explicit
+            // overload/rate-limit statuses, or no status at all (network blips, truncated-
+            // JSON parse failures from SyntaxError, which carry no .status). A genuine
+            // client error (400 malformed request, 401/403 auth/safety block) has a status
+            // outside this set and fails fast instead of burning the full retry budget on
+            // an error that will be identical on every attempt.
+            const isTransient = error.status === 503 || error.status === 429 || !error.status;
+            if (isTransient && i < retries - 1) {
                 console.log(`Gemini call failed (${error.status || 'no status'}: ${error.message || error}). Retrying in ${delay / 1000}s...`);
                 await new Promise(resolve => setTimeout(resolve, delay));
                 delay *= 2;
@@ -465,6 +523,44 @@ Each object MUST have exactly two keys: 'title' (the exact song name) and 'artis
 DO NOT ADD ANY OTHER TEXT OR MARKDOWN, JUST THE JSON.`;
 
     return callGeminiForSongs(prompt);
+}
+
+// --- Scheduled Jobs ---
+// Builds and sends the weekly "songs saved this week" recap. Wrapped in its own try/catch
+// so a Mongo query failure or Telegram send failure never crashes the cron scheduler or
+// the server — worst case, one week's summary silently doesn't arrive and next week's
+// run is unaffected.
+async function sendWeeklySummary() {
+    try {
+        const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        const entries = await HistoryEntry.find({
+            type: 'added',
+            createdAt: { $gte: sevenDaysAgo }
+        }).sort({ createdAt: -1 });
+
+        if (entries.length === 0) {
+            await pushDashboardUpdate('📅 סיכום שבועי: לא נשמרו שירים חדשים השבוע.');
+            return;
+        }
+
+        const trackList = entries.map((entry, i) => `${i + 1}. ${entry.title} - ${entry.artist}`).join('\n');
+        const summary = `📅 סיכום שבועי\n\nהשבוע נשמרו ${entries.length} שירים חדשים ל-Liked Songs:\n\n${trackList}`;
+
+        await pushDashboardUpdate(summary);
+        console.log(`Weekly summary sent: ${entries.length} tracks.`);
+    } catch (err) {
+        console.error("Weekly summary job failed:", err.message);
+    }
+}
+
+// Every Sunday at 09:00, Israel time (adjust the timezone if deploying for a different
+// audience — node-cron defaults to the server's own system timezone otherwise, which on
+// Railway would be UTC, not the intended local time).
+function scheduleWeeklySummary() {
+    cron.schedule('0 9 * * 0', () => {
+        sendWeeklySummary().catch(err => console.error("Unexpected weekly summary error:", err.message));
+    }, { timezone: 'Asia/Jerusalem' });
+    console.log("Weekly summary job scheduled: every Sunday at 09:00 (Asia/Jerusalem).");
 }
 
 // --- Telegram Listeners (Home Mode) ---
@@ -527,8 +623,28 @@ bot.onText(/\/debug/, async (msg) => {
 });
 
 bot.on('message', async (msg) => {
-    BotConfig.findByIdAndUpdate('singleton', { dashboardChatId: msg.chat.id }, { upsert: true })
-        .catch(err => console.error("Failed to persist dashboardChatId:", err.message));
+    try {
+        if (TELEGRAM_OWNER_CHAT_ID) {
+            if (msg.chat.id === TELEGRAM_OWNER_CHAT_ID) {
+                await BotConfig.findByIdAndUpdate('singleton', { dashboardChatId: msg.chat.id }, { upsert: true });
+            } else {
+                console.log(`Ignoring message from non-owner chat ${msg.chat.id} (TELEGRAM_OWNER_CHAT_ID is set).`);
+            }
+        } else {
+            // No explicit owner configured — "claim once": the first chat to ever message
+            // the bot becomes the dashboard destination, and a later message from a
+            // DIFFERENT chat no longer silently overwrites it (the old, unconditional
+            // overwrite let any stranger who messaged the bot hijack all notifications).
+            const config = await BotConfig.findById('singleton');
+            if (!config?.dashboardChatId || config.dashboardChatId === msg.chat.id) {
+                await BotConfig.findByIdAndUpdate('singleton', { dashboardChatId: msg.chat.id }, { upsert: true });
+            } else {
+                console.log(`Ignoring message from unrecognized chat ${msg.chat.id} (dashboard owner is ${config.dashboardChatId}).`);
+            }
+        }
+    } catch (err) {
+        console.error("Failed to check/persist dashboardChatId:", err.message);
+    }
 
     const text = msg.text?.trim();
     if (!text || text === '/start' || text === '/debug' || text === '/history' || text === 'היסטוריה') return;
@@ -609,25 +725,30 @@ bot.on('callback_query', async (query) => {
         }
 
     } else if (data.startsWith('toggle_')) {
-        const trackId = data.slice('toggle_'.length);
+        // Note: the button's own trackId isn't used here — toggle acts on whatever is
+        // globally playing/paused on the device, which may not be this card's track at
+        // all (there's no per-track pause in Spotify's API), so history is logged against
+        // whatever's actually playing (below), not the button that was pressed.
         bot.answerCallbackQuery(query.id, { text: 'מחליף מצב נגינה...' });
 
         try {
             const accessToken = await getSpotifyAccessToken();
-            const device = await getActiveDevice(accessToken);
+            const { device, isPlaying } = await getPlaybackState(accessToken);
             if (!device) {
                 bot.sendMessage(chatId, `❌ לא מצאתי מכשיר ספוטיפיי פעיל.`);
             } else {
-                const info = await getTrackInfo(accessToken, trackId);
-                const artistNames = info.artists.map(a => a.name).join(', ');
-                if (await isCurrentlyPlaying(accessToken)) {
+                if (isPlaying) {
                     await pausePlaybackOnDevice(accessToken, device.id);
                     bot.sendMessage(chatId, `⏸ עצרתי את המוזיקה.`);
                 } else {
                     await resumePlaybackOnDevice(accessToken, device.id);
                     bot.sendMessage(chatId, `▶️ ממשיך לנגן.`);
                 }
-                await logInteraction('toggled', trackId, info.name, artistNames);
+                const nowPlaying = await getCurrentlyPlayingTrack(accessToken);
+                if (nowPlaying) {
+                    const artistNames = nowPlaying.artists.map(a => a.name).join(', ');
+                    await logInteraction('toggled', nowPlaying.id, nowPlaying.name, artistNames);
+                }
             }
         } catch (error) {
             console.error(`Spotify API error:`, error.response?.data || error.message);
@@ -686,6 +807,14 @@ app.get('/', (req, res) => {
     res.send("Music Server is LIVE!");
 });
 
+// Serializes background Siri processing so overlapping requests can never interleave —
+// processSiriCommand reads/writes the shared `currentSession` state across several await
+// points, and two concurrent invocations (e.g. a quick "next" followed by a new "playlist"
+// request) could otherwise race and corrupt or misapply the session. Chaining onto a single
+// promise guarantees each call fully finishes before the next one starts, without needing a
+// mutex library — this is a low-traffic personal bot, so a request queue costs nothing.
+let siriProcessingQueue = Promise.resolve();
+
 app.post('/api/siri', (req, res) => {
     const voiceCommand = req.body.command || req.body.text;
 
@@ -700,9 +829,9 @@ app.post('/api/siri', (req, res) => {
     // of the HTTP response, since there's no live request left to send it back on.
     res.status(200).send({ status: "success", message: "מטפל בבקשה ומעדכן אותך בטלגרם." });
 
-    processSiriCommand(voiceCommand).catch(err => {
-        console.error("Background Siri processing failed:", err.message);
-    });
+    siriProcessingQueue = siriProcessingQueue
+        .then(() => processSiriCommand(voiceCommand))
+        .catch(err => console.error("Background Siri processing failed:", err.message));
 });
 
 async function processSiriCommand(voiceCommand) {
@@ -711,9 +840,8 @@ async function processSiriCommand(voiceCommand) {
     // 1. Send to Gemini to classify the intent of the sentence
     const parsed = await parseSiriCommand(voiceCommand);
 
-
     if (!parsed) {
-        pushDashboardUpdate(`🎙️ Siri: לא הצלחתי להבין את הפקודה "${voiceCommand}".`);
+        await pushDashboardUpdate(`🎙️ Siri: לא הצלחתי להבין את הפקודה "${voiceCommand}".`);
         return;
     }
 
@@ -732,9 +860,11 @@ async function processSiriCommand(voiceCommand) {
             console.error("Playlist session error:", error.response?.data || error.message);
             sessionReply = `הייתה תקלה בהמשך הפלייליסט. בדוק טרמינל.`;
         }
-        // addCurrentTrackToSession already pushes its own "✅ נוסף..." update on add;
-        // "skip" (advanceSession) doesn't push anything on its own, so do it here
-        if (parsed.intent === "next") pushDashboardUpdate(`🎙️ Siri: ${sessionReply}`);
+        // Always push exactly once here (addCurrentTrackToSession no longer pushes its own
+        // partial update) so a failure partway through — e.g. the save succeeds but the
+        // internal advance-to-next-track fails — still reaches the user instead of going
+        // silent because the "add" branch used to rely on an internal push that never ran
+        await pushDashboardUpdate(`🎙️ Siri: ${sessionReply}`);
         return;
     }
 
@@ -752,6 +882,12 @@ async function processSiriCommand(voiceCommand) {
 
     // 3. Actually drive Spotify playback for player-control intents
     let replyText = "";
+    // Tracks whether this intent already pushed its own specific Telegram feedback (e.g.
+    // a track card), so the generic fallback below only fires when nothing was sent yet —
+    // replacing a static "these 3 intents always notify themselves" assumption, which was
+    // wrong: their own FAILURE branches (no match, track not on Spotify, no device, no
+    // research results) never pushed anything and went completely silent.
+    let notified = false;
     try {
         switch (parsed.intent) {
             case "play": {
@@ -767,9 +903,19 @@ async function processSiriCommand(voiceCommand) {
                 }
                 const played = await tryPlayTrack(accessToken, track.id);
                 if (played) {
+                    if (currentSession) {
+                        // A direct "play" while a driving session is active means the
+                        // session's bookkeeping no longer matches what's actually playing —
+                        // end it rather than let a later "add"/"skip" act on a stale track.
+                        console.log("Ending driving session: a direct play command changed what's playing.");
+                        currentSession = null;
+                    }
                     await logInteraction('played', track.id, match.title, match.artist);
                     const chatId = await getDashboardChatId();
-                    if (chatId) sendTrackCard(chatId, track, match.title, match.artist);
+                    if (chatId) {
+                        sendTrackCard(chatId, track, match.title, match.artist);
+                        notified = true;
+                    }
                 }
                 replyText = played
                     ? `מפעיל עכשיו את "${match.title}" של ${match.artist}.`
@@ -811,7 +957,8 @@ async function processSiriCommand(voiceCommand) {
                 }
                 await saveTrackToLibrary(accessToken, track.id);
                 await logInteraction('added', track.id, match.title, match.artist);
-                pushDashboardUpdate(`✅ נוסף ל-Liked Songs (Siri): ${match.title} - ${match.artist}`);
+                await pushDashboardUpdate(`✅ נוסף ל-Liked Songs (Siri): ${match.title} - ${match.artist}`);
+                notified = true;
                 replyText = `שמרתי את "${match.title}" של ${match.artist} לספרייה.`;
                 break;
             }
@@ -828,11 +975,17 @@ async function processSiriCommand(voiceCommand) {
                     break;
                 }
 
-                const tracks = [];
-                for (const song of research.songs) {
-                    const track = await searchSpotifyTrack(accessToken, song.title, song.artist);
-                    if (track) tracks.push({ trackId: track.id, title: song.title, artist: song.artist });
-                }
+                // Resolve all candidates concurrently — this is on the critical path before
+                // any audio starts in a voice-triggered driving session, and sequentially
+                // resolving 5-6 songs (each up to 2 Spotify calls) added real, noticeable
+                // silence before playback began. Promise.all preserves order, so tracks[0]
+                // still corresponds to research.songs[0] regardless of resolution order.
+                const resolved = await Promise.all(
+                    research.songs.map(song => searchSpotifyTrack(accessToken, song.title, song.artist).catch(() => null))
+                );
+                const tracks = research.songs
+                    .map((song, i) => resolved[i] && { trackId: resolved[i].id, title: song.title, artist: song.artist })
+                    .filter(Boolean);
 
                 if (tracks.length === 0) {
                     replyText = `לא מצאתי אף שיר זמין בספוטיפיי לבקשה הזו.`;
@@ -841,7 +994,8 @@ async function processSiriCommand(voiceCommand) {
 
                 currentSession = { tracks, currentIndex: 0 };
                 console.log(`Driving session started: ${tracks.length} tracks`);
-                pushDashboardUpdate(`🚗 סשן פלייליסט התחיל: "${parsed.search_query}" (${tracks.length} שירים)`);
+                await pushDashboardUpdate(`🚗 סשן פלייליסט התחיל: "${parsed.search_query}" (${tracks.length} שירים)`);
+                notified = true;
 
                 const device = await tryPlayTrack(accessToken, tracks[0].trackId);
                 if (device) {
@@ -871,12 +1025,48 @@ async function processSiriCommand(voiceCommand) {
     // Note: search_lyrics is identification-only by design (there's no Spotify action
     // to take beyond naming the matched track), so it just returns the spoken match
 
-    // play/add_to_library/playlist already pushed their own specific Telegram feedback
-    // above; everything else (pause/next/search_lyrics/unknown) gets this generic
-    // fallback so the outcome is still visible somewhere now that Siri never hears it
-    const alreadyNotified = ["play", "add_to_library", "playlist"].includes(parsed.intent);
-    if (!alreadyNotified) {
-        pushDashboardUpdate(`🎙️ Siri: ${replyText}`);
+    // Fires for every case that didn't already push its own specific feedback — covers
+    // pause/next/search_lyrics/unknown, AND every failure branch of play/add_to_library/
+    // playlist (no match, track not on Spotify, no device, no research results), which
+    // previously went completely silent under the old static intent-name check
+    if (!notified) {
+        await pushDashboardUpdate(`🎙️ Siri: ${replyText}`);
+    }
+}
+
+// "Save what's playing right now" — no Gemini/NLU needed, so this is its own fast route
+// rather than an /api/siri intent. Immediate-response pattern kept for consistency with
+// /api/siri even though this path is inherently quick, so a slow Spotify response can
+// never cause a Shortcut timeout here either.
+app.post('/api/save-current', (req, res) => {
+    res.status(200).send({ status: "success", message: "בודק מה מתנגן ושומר..." });
+    saveCurrentlyPlayingTrack().catch(err => {
+        console.error("Background save-current-track processing failed:", err.message);
+    });
+});
+
+async function saveCurrentlyPlayingTrack() {
+    try {
+        const accessToken = await getSpotifyAccessToken();
+        const track = await getCurrentlyPlayingTrack(accessToken);
+
+        if (!track) {
+            // Covers both "nothing playing" (204) and "it's a podcast episode/ad, not a
+            // track" (currently_playing_type !== 'track') — getCurrentlyPlayingTrack
+            // returns null for either, so this message is deliberately worded to fit both
+            console.log("Nothing savable currently playing (either idle or non-track content).");
+            await pushDashboardUpdate("🎧 אין שיר לשמור כרגע (אולי שום דבר לא מתנגן, או שזה פודקאסט ולא שיר).");
+            return;
+        }
+
+        const artistNames = track.artists.map(a => a.name).join(', ');
+        await saveTrackToLibrary(accessToken, track.id);
+        await logInteraction('added', track.id, track.name, artistNames);
+        console.log(`Saved currently playing track "${track.name}" to Liked Songs.`);
+        await pushDashboardUpdate(`✅ נשמר ל-Liked Songs: ${track.name} - ${artistNames}`);
+    } catch (error) {
+        console.error("Save-current-track error:", error.response?.data || error.message);
+        await pushDashboardUpdate("❌ הייתה תקלה בשמירת השיר הנוכחי. בדוק טרמינל.");
     }
 }
 
@@ -938,6 +1128,8 @@ async function start() {
         { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
     );
     console.log(`Dashboard chat ID in DB: ${config.dashboardChatId ?? '(none yet)'}`);
+
+    scheduleWeeklySummary();
 
     bot.startPolling();
     app.listen(PORT, () => {
