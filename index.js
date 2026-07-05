@@ -425,19 +425,17 @@ async function parseSiriCommand(voiceCommand) {
         Only use intent "play" WITH a non-empty search_query when the user actually names
         a specific song, artist, or genre to play.
 
-        LYRICS RESOLUTION (for "search_lyrics" intent): if the user is reciting song
-        lyrics, do NOT put the raw lyrics in search_query — Spotify's search engine
-        doesn't match on lyric content and returns zero results. Instead, use your own
-        knowledge to identify which real song these lyrics are from, and set search_query
-        to "<resolved song title> <resolved artist name>" (e.g., the lyric "ולמה בכלל הוא
-        כזה מיוחד" is from "מי זה מחזיק לך את היד" by Eyal Golan, so search_query should be
-        "מי זה מחזיק לך את היד Eyal Golan", not the lyric itself). If you can't confidently
-        identify the song, fall back to the raw lyrics text.
+        For "search_lyrics": set search_query to the raw recited lyrics text exactly as
+        spoken — do NOT try to identify the song here. A dedicated, search-grounded
+        resolution step handles that afterward with much higher accuracy than a quick
+        classification guess can (an earlier version of this prompt tried to resolve the
+        song here and hallucinated wrong answers for real lyrics — verification needs an
+        actual search, not a guess).
 
         Return ONLY a valid JSON in this exact format (no markdown):
         {
             "intent": "play|pause|next|add_to_library|search_lyrics|playlist|unknown",
-            "search_query": "resolved song title + artist (or artist/genre name) to search on Spotify — NEVER raw lyrics or a playback-control word. Empty string if not applicable."
+            "search_query": "song title + artist (or artist/genre name) to search on Spotify for every intent EXCEPT search_lyrics, where this must be the raw recited lyrics. Never a playback-control word. Empty string if not applicable."
         }`;
         const result = await model.generateContent(prompt);
         const response = await result.response;
@@ -544,6 +542,30 @@ Each object MUST have exactly two keys: 'title' (the exact song name) and 'artis
 DO NOT ADD ANY OTHER TEXT OR MARKDOWN, JUST THE JSON.`;
 
     return callGeminiForSongs(prompt);
+}
+
+// Resolves recited lyrics to a specific, verified song. Unlike researchMusic (built for
+// open-ended music discovery, where "couldn't find anything great" is an acceptable
+// outcome), misidentifying lyrics as the WRONG song is worse than not resolving it at
+// all, so this prompt is deliberately stricter: it requires an explicit search-verification
+// step and an honest "give up" path instead of a plausible-sounding guess. Uses a tighter
+// retry budget than the default (2 attempts, 1.5s base) since this runs synchronously in
+// the request/response cycle — Siri is waiting on this call, unlike the async paths.
+async function resolveLyricsToSong(lyrics) {
+    const prompt = `You are a music-identification expert. A user recited these song lyrics: "${lyrics}"
+
+Your task: identify the EXACT real song and artist these lyrics are from, with high confidence.
+1. First, form a hypothesis for the song title and artist using your own knowledge.
+2. Then you MUST use Google Search to verify — search for the exact lyrics text (or a distinctive fragment of it) to confirm which real song and artist they belong to. Do not skip this step.
+3. If the search results confirm your hypothesis, return it.
+4. If you cannot confirm a match with high confidence after searching, return {"songs": []}. Do NOT guess or return a plausible-sounding but unverified answer — a wrong answer is worse than no answer.
+
+You MUST return ONLY a valid JSON object.
+The JSON must have a single key 'songs' containing an array of at most 1 object (the single confirmed match), or an empty array if you couldn't confirm one.
+Each object MUST have exactly two keys: 'title' (the exact song name, in its original language/script) and 'artist' (the exact artist name).
+DO NOT ADD ANY OTHER TEXT OR MARKDOWN, JUST THE JSON.`;
+
+    return callGeminiForSongs(prompt, 2, 1500);
 }
 
 // --- Scheduled Jobs ---
@@ -836,38 +858,51 @@ app.get('/', (req, res) => {
 // mutex library — this is a low-traffic personal bot, so a request queue costs nothing.
 let siriProcessingQueue = Promise.resolve();
 
-app.post('/api/siri', (req, res) => {
+app.post('/api/siri', async (req, res) => {
+    // Follow-up turn of the lyrics-confirmation conversation: the Shortcut dictated the
+    // user's yes/no answer and sent back the { uri, title, artist } context from the
+    // previous turn's response. This request shape only exists for that one flow.
+    if (req.body.answer !== undefined && req.body.context) {
+        return handleLyricsConfirmation(req, res);
+    }
+
     const voiceCommand = req.body.command || req.body.text;
 
     if (!voiceCommand) {
         return res.status(400).send({ status: "error", message: "לא סופקה פקודה." });
     }
 
-    // Respond immediately — Siri's own voice-interaction patience window is shorter than
-    // Gemini research + Spotify round-trips can reliably take (confirmed: broad queries
-    // like "80s jazz" made Siri show "Something went wrong" even though the song played
-    // moments later). The real outcome now arrives via the Telegram dashboard push instead
-    // of the HTTP response, since there's no live request left to send it back on.
-    res.status(200).send({ status: "success", message: "מטפל בבקשה ומעדכן אותך בטלגרם." });
-
-    siriProcessingQueue = siriProcessingQueue
-        .then(() => processSiriCommand(voiceCommand))
-        .catch(err => console.error("Background Siri processing failed:", err.message));
-});
-
-async function processSiriCommand(voiceCommand) {
     console.log(`\nSiri voice command received: "${voiceCommand}"`);
-
-    // 1. Send to Gemini to classify the intent of the sentence
     const parsed = await parseSiriCommand(voiceCommand);
 
     if (!parsed) {
-        await pushDashboardUpdate(`🎙️ Siri: לא הצלחתי להבין את הפקודה "${voiceCommand}".`);
-        return;
+        return res.status(200).send({ speech: `לא הצלחתי להבין את הפקודה "${voiceCommand}".`, listen: false });
     }
 
     console.log(`Siri intent: [${parsed.intent}] | Query: [${parsed.search_query}]`);
 
+    // Lyrics search is the one intent Siri actually needs to wait for and speak — "found
+    // it, want me to play it?" is a real conversational moment. Every other intent stays
+    // on the immediate-response + background pattern below (Siri's own patience window is
+    // shorter than Gemini research + Spotify round-trips can reliably take — confirmed:
+    // broad queries like "80s jazz" made Siri show "Something went wrong" even though the
+    // song played moments later). This lyrics path carries the same timeout risk since
+    // it's at least as slow, which is a real, deliberate tradeoff for this one flow.
+    if (parsed.intent === "search_lyrics") {
+        return handleLyricsSearch(res, parsed.search_query || voiceCommand);
+    }
+
+    // Respond immediately — see rationale above. The real outcome arrives via the
+    // Telegram dashboard push instead of the HTTP response, since there's no live request
+    // left to send it back on by the time the background work finishes.
+    res.status(200).send({ status: "success", message: "מטפל בבקשה ומעדכן אותך בטלגרם." });
+
+    siriProcessingQueue = siriProcessingQueue
+        .then(() => processSiriCommand(parsed))
+        .catch(err => console.error("Background Siri processing failed:", err.message));
+});
+
+async function processSiriCommand(parsed) {
     // 1b. Interactive playlist session: while a session is active, "add" (add_to_library)
     //     and "skip" (next) act on the current session track instead of a fresh lookup
     if (currentSession && (parsed.intent === "add_to_library" || parsed.intent === "next")) {
@@ -890,8 +925,10 @@ async function processSiriCommand(voiceCommand) {
     }
 
     // 2. For intents about a specific song, run the same deep-curation lookup
-    //    used by the Telegram flow so replies reference a real, verified track
-    const needsLookup = ["play", "add_to_library", "search_lyrics"].includes(parsed.intent);
+    //    used by the Telegram flow so replies reference a real, verified track.
+    // (search_lyrics never reaches here — it's handled synchronously by
+    // handleLyricsSearch before this function is ever called.)
+    const needsLookup = ["play", "add_to_library"].includes(parsed.intent);
     let match = null;
 
     if (needsLookup && parsed.search_query) {
@@ -996,11 +1033,6 @@ async function processSiriCommand(voiceCommand) {
                 replyText = `שמרתי את "${match.title}" של ${match.artist} לספרייה.`;
                 break;
             }
-            case "search_lyrics":
-                replyText = match
-                    ? `מצאתי: "${match.title}" של ${match.artist}.`
-                    : `לא הצלחתי למצוא שיר לפי המילים: ${parsed.search_query}.`;
-                break;
             case "playlist": {
                 const accessToken = await getSpotifyAccessToken();
                 const research = await researchMusic(parsed.search_query);
@@ -1056,15 +1088,86 @@ async function processSiriCommand(voiceCommand) {
         replyText = `הייתה תקלה בשליטה על ספוטיפיי. בדוק טרמינל.`;
     }
 
-    // Note: search_lyrics is identification-only by design (there's no Spotify action
-    // to take beyond naming the matched track), so it just returns the spoken match
-
     // Fires for every case that didn't already push its own specific feedback — covers
-    // pause/next/search_lyrics/unknown, AND every failure branch of play/add_to_library/
-    // playlist (no match, track not on Spotify, no device, no research results), which
-    // previously went completely silent under the old static intent-name check
+    // pause/next/unknown, AND every failure branch of play/add_to_library/playlist (no
+    // match, track not on Spotify, no device, no research results), which previously went
+    // completely silent under the old static intent-name check
     if (!notified) {
         await pushDashboardUpdate(`🎙️ Siri: ${replyText}`);
+    }
+}
+
+// Synchronous turn 1 of the lyrics conversation: resolve → find on Spotify → push the
+// rich card to Telegram regardless of what the user answers next → ask Siri to speak the
+// result and listen for yes/no. Unlike every other /api/siri path, this one really does
+// wait for the full result before responding (see the risk note where this is called).
+async function handleLyricsSearch(res, lyrics) {
+    try {
+        const result = await resolveLyricsToSong(lyrics);
+        if (!result.songs || result.songs.length === 0) {
+            return res.status(200).send({ speech: `לא הצלחתי לזהות בביטחון שיר לפי המילים "${lyrics}".`, listen: false });
+        }
+
+        const match = result.songs[0];
+        const accessToken = await getSpotifyAccessToken();
+        const track = await searchSpotifyTrack(accessToken, match.title, match.artist);
+        if (!track) {
+            return res.status(200).send({ speech: `זיהיתי את "${match.title}" של ${match.artist}, אבל הוא לא זמין בספוטיפיי.`, listen: false });
+        }
+
+        // Push the standard rich card immediately on a successful identification — same
+        // as any other successful search — independent of whatever the user answers below
+        const chatId = await getDashboardChatId();
+        if (chatId) sendTrackCard(chatId, track, match.title, match.artist);
+
+        return res.status(200).send({
+            speech: `מצאתי את "${match.title}" של ${match.artist}. לנגן עכשיו?`,
+            listen: true,
+            context: { uri: `spotify:track:${track.id}`, title: match.title, artist: match.artist }
+        });
+    } catch (error) {
+        console.error("Lyrics search error:", error.response?.data || error.message);
+        return res.status(200).send({ speech: "הייתה תקלה בחיפוש השיר. נסה שוב.", listen: false });
+    }
+}
+
+// Turn 2: the Shortcut dictated the user's answer to "play it now?" and sent back the
+// context object verbatim from turn 1's response.
+async function handleLyricsConfirmation(req, res) {
+    const { answer, context } = req.body;
+    // No \b word-boundary here — JS regex treats \b as an ASCII \w boundary, which
+    // doesn't work reliably right after Hebrew letters (they aren't \w characters), so a
+    // boundary-based match silently failed to recognize "כן" at all
+    const isYes = /^(כן|yes)/i.test((answer || '').trim());
+
+    if (!isYes) {
+        return res.status(200).send({ speech: "אוקיי.", listen: false });
+    }
+
+    try {
+        const trackId = context?.uri?.split(':').pop();
+        if (!trackId) {
+            return res.status(200).send({ speech: "משהו השתבש, נסה שוב.", listen: false });
+        }
+
+        const accessToken = await getSpotifyAccessToken();
+        const device = await tryPlayTrack(accessToken, trackId);
+        if (!device) {
+            return res.status(200).send({ speech: "לא מצאתי מכשיר ספוטיפיי פעיל.", listen: false });
+        }
+
+        if (currentSession) {
+            // Same rule as the regular "play" intent: a direct play outside the session
+            // flow means the session's bookkeeping no longer matches reality — end it.
+            console.log("Ending driving session: lyrics-confirmed play changed what's playing.");
+            currentSession = null;
+        }
+        await logInteraction('played', trackId, context.title || '', context.artist || '');
+
+        return res.status(200).send({ speech: `מפעיל את "${context.title}".`, listen: false });
+    } catch (error) {
+        console.error("Lyrics confirmation playback error:", error.response?.data || error.message);
+        return res.status(200).send({ speech: "הייתה תקלה בניגון השיר.", listen: false });
     }
 }
 
