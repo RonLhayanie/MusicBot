@@ -405,18 +405,39 @@ async function parseSiriCommand(voiceCommand) {
         User's voice command: "${voiceCommand}"
 
         Classify the intent into one of these categories:
-        - "play" (user wants to play a specific artist, song, or genre)
+        - "play" (user wants to play a specific artist, song, or genre, OR wants to
+          resume/continue playback with no specific song named)
         - "pause" (user wants to stop/pause music)
         - "next" (user wants to skip to the next track)
         - "add_to_library" (user wants to save the current song or a specific song)
-        - "search_lyrics" (user is reciting lyrics to find a song)
+        - "search_lyrics" (user is reciting song lyrics to find a song)
         - "playlist" (user wants to add to or create a playlist)
         - "unknown"
+
+        CRITICAL — PLAYBACK CONTROL WORDS: short commands like these are direct player
+        controls, NOT song titles to search for. NEVER put these words themselves into
+        search_query:
+        - "עצור", "תעצור", "תשהה" (and equivalents) → intent "pause", search_query ""
+        - "הבא", "תעביר", "דלג" (and equivalents) → intent "next", search_query ""
+        - "המשך", "הפעל", "נגן", "תנגן" said ALONE with no specific song/artist/genre
+          named → intent "play", search_query "" (this means resume/continue playback,
+          not search for a song literally called "הפעל")
+        Only use intent "play" WITH a non-empty search_query when the user actually names
+        a specific song, artist, or genre to play.
+
+        LYRICS RESOLUTION (for "search_lyrics" intent): if the user is reciting song
+        lyrics, do NOT put the raw lyrics in search_query — Spotify's search engine
+        doesn't match on lyric content and returns zero results. Instead, use your own
+        knowledge to identify which real song these lyrics are from, and set search_query
+        to "<resolved song title> <resolved artist name>" (e.g., the lyric "ולמה בכלל הוא
+        כזה מיוחד" is from "מי זה מחזיק לך את היד" by Eyal Golan, so search_query should be
+        "מי זה מחזיק לך את היד Eyal Golan", not the lyric itself). If you can't confidently
+        identify the song, fall back to the raw lyrics text.
 
         Return ONLY a valid JSON in this exact format (no markdown):
         {
             "intent": "play|pause|next|add_to_library|search_lyrics|playlist|unknown",
-            "search_query": "relevant text to search on Spotify (e.g. artist name, song name, lyrics) if applicable. Otherwise leave empty."
+            "search_query": "resolved song title + artist (or artist/genre name) to search on Spotify — NEVER raw lyrics or a playback-control word. Empty string if not applicable."
         }`;
         const result = await model.generateContent(prompt);
         const response = await result.response;
@@ -891,6 +912,19 @@ async function processSiriCommand(voiceCommand) {
     try {
         switch (parsed.intent) {
             case "play": {
+                if (!parsed.search_query) {
+                    // "המשך"/"הפעל"/"נגן" said with no song/artist/genre named means
+                    // resume playback, not search for a nonexistent song by that name
+                    const accessToken = await getSpotifyAccessToken();
+                    const device = await getActiveDevice(accessToken);
+                    if (!device) {
+                        replyText = `לא מצאתי מכשיר ספוטיפיי פעיל.`;
+                        break;
+                    }
+                    await resumePlaybackOnDevice(accessToken, device.id);
+                    replyText = `ממשיך לנגן.`;
+                    break;
+                }
                 if (!match) {
                     replyText = `לא הצלחתי לאתר שיר תואם ל-${parsed.search_query}.`;
                     break;
