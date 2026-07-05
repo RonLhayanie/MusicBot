@@ -859,10 +859,15 @@ app.get('/', (req, res) => {
 let siriProcessingQueue = Promise.resolve();
 
 app.post('/api/siri', async (req, res) => {
+    console.log('Follow-up answer received:', req.body);
+
     // Follow-up turn of the lyrics-confirmation conversation: the Shortcut dictated the
     // user's yes/no answer and sent back the { uri, title, artist } context from the
     // previous turn's response. This request shape only exists for that one flow.
-    if (req.body.answer !== undefined && req.body.context) {
+    // Detected on `answer` alone (not requiring a truthy `context` too) so a
+    // missing/malformed context still routes here to be handled gracefully, rather than
+    // silently falling through to "no command supplied".
+    if (req.body.answer !== undefined) {
         return handleLyricsConfirmation(req, res);
     }
 
@@ -1134,11 +1139,27 @@ async function handleLyricsSearch(res, lyrics) {
 // Turn 2: the Shortcut dictated the user's answer to "play it now?" and sent back the
 // context object verbatim from turn 1's response.
 async function handleLyricsConfirmation(req, res) {
-    const { answer, context } = req.body;
-    // No \b word-boundary here — JS regex treats \b as an ASCII \w boundary, which
-    // doesn't work reliably right after Hebrew letters (they aren't \w characters), so a
-    // boundary-based match silently failed to recognize "כן" at all
-    const isYes = /^(כן|yes)/i.test((answer || '').trim());
+    const { answer } = req.body;
+    let { context } = req.body;
+
+    // iOS Shortcuts can serialize a "Dictionary" variable as a JSON string rather than a
+    // nested object depending on how the Shortcut passes it along — handle both shapes.
+    if (typeof context === 'string') {
+        try {
+            context = JSON.parse(context);
+        } catch (err) {
+            console.error("Failed to parse context as JSON:", err.message, "raw value:", context);
+            context = null;
+        }
+    }
+
+    // No \b word-boundary (JS regex treats \b as an ASCII \w boundary, which doesn't work
+    // right after Hebrew letters), no anchors (dictated answers can carry a trailing
+    // period/punctuation, filler words, or "כן בטח"/"yes please" — matching anywhere in
+    // the (punctuation-stripped) string is more forgiving than requiring an exact prefix).
+    const normalizedAnswer = (answer || '').trim().replace(/[.,!?׃]+$/, '');
+    const isYes = /כן|yes/i.test(normalizedAnswer);
+    console.log(`Lyrics confirmation: answer="${answer}" -> normalized="${normalizedAnswer}" -> isYes=${isYes}, context=`, context);
 
     if (!isYes) {
         return res.status(200).send({ speech: "אוקיי.", listen: false });
@@ -1146,6 +1167,7 @@ async function handleLyricsConfirmation(req, res) {
 
     try {
         const trackId = context?.uri?.split(':').pop();
+        console.log(`Resolved trackId from context.uri: ${trackId}`);
         if (!trackId) {
             return res.status(200).send({ speech: "משהו השתבש, נסה שוב.", listen: false });
         }
