@@ -698,7 +698,7 @@ app.post('/api/siri', (req, res) => {
     // like "80s jazz" made Siri show "Something went wrong" even though the song played
     // moments later). The real outcome now arrives via the Telegram dashboard push instead
     // of the HTTP response, since there's no live request left to send it back on.
-    res.status(200).send({ status: "success", message: "מטפל בבקשה, תעדכן אותך בטלגרם." });
+    res.status(200).send({ status: "success", message: "מטפל בבקשה ומעדכן אותך בטלגרם." });
 
     processSiriCommand(voiceCommand).catch(err => {
         console.error("Background Siri processing failed:", err.message);
