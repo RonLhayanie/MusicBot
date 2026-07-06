@@ -859,15 +859,10 @@ app.get('/', (req, res) => {
 let siriProcessingQueue = Promise.resolve();
 
 app.post('/api/siri', async (req, res) => {
-    console.log('Follow-up answer received:', req.body);
-
     // Follow-up turn of the lyrics-confirmation conversation: the Shortcut dictated the
     // user's yes/no answer and sent back the { uri, title, artist } context from the
     // previous turn's response. This request shape only exists for that one flow.
-    // Detected on `answer` alone (not requiring a truthy `context` too) so a
-    // missing/malformed context still routes here to be handled gracefully, rather than
-    // silently falling through to "no command supplied".
-    if (req.body.answer !== undefined) {
+    if (req.body.answer !== undefined && req.body.context) {
         return handleLyricsConfirmation(req, res);
     }
 
@@ -1139,27 +1134,11 @@ async function handleLyricsSearch(res, lyrics) {
 // Turn 2: the Shortcut dictated the user's answer to "play it now?" and sent back the
 // context object verbatim from turn 1's response.
 async function handleLyricsConfirmation(req, res) {
-    const { answer } = req.body;
-    let { context } = req.body;
-
-    // iOS Shortcuts can serialize a "Dictionary" variable as a JSON string rather than a
-    // nested object depending on how the Shortcut passes it along — handle both shapes.
-    if (typeof context === 'string') {
-        try {
-            context = JSON.parse(context);
-        } catch (err) {
-            console.error("Failed to parse context as JSON:", err.message, "raw value:", context);
-            context = null;
-        }
-    }
-
-    // No \b word-boundary (JS regex treats \b as an ASCII \w boundary, which doesn't work
-    // right after Hebrew letters), no anchors (dictated answers can carry a trailing
-    // period/punctuation, filler words, or "כן בטח"/"yes please" — matching anywhere in
-    // the (punctuation-stripped) string is more forgiving than requiring an exact prefix).
-    const normalizedAnswer = (answer || '').trim().replace(/[.,!?׃]+$/, '');
-    const isYes = /כן|yes/i.test(normalizedAnswer);
-    console.log(`Lyrics confirmation: answer="${answer}" -> normalized="${normalizedAnswer}" -> isYes=${isYes}, context=`, context);
+    const { answer, context } = req.body;
+    // No \b word-boundary here — JS regex treats \b as an ASCII \w boundary, which
+    // doesn't work reliably right after Hebrew letters (they aren't \w characters), so a
+    // boundary-based match silently failed to recognize "כן" at all
+    const isYes = /^(כן|yes)/i.test((answer || '').trim());
 
     if (!isYes) {
         return res.status(200).send({ speech: "אוקיי.", listen: false });
@@ -1167,7 +1146,6 @@ async function handleLyricsConfirmation(req, res) {
 
     try {
         const trackId = context?.uri?.split(':').pop();
-        console.log(`Resolved trackId from context.uri: ${trackId}`);
         if (!trackId) {
             return res.status(200).send({ speech: "משהו השתבש, נסה שוב.", listen: false });
         }
@@ -1226,52 +1204,6 @@ async function saveCurrentlyPlayingTrack() {
     } catch (error) {
         console.error("Save-current-track error:", error.response?.data || error.message);
         await pushDashboardUpdate("❌ הייתה תקלה בשמירת השיר הנוכחי. בדוק טרמינל.");
-    }
-}
-
-// "Shazam something playing in the background (e.g. from YouTube) and save it" — the
-// Shortcut already did the audio recognition, so this just resolves a known title/artist
-// to a real Spotify track and saves it. No Gemini/NLU involved, so — like /api/save-current
-// — this stays on the immediate-response pattern rather than the conversational one used
-// for lyrics (there's no ambiguity here to confirm; Shazam's answer is already specific).
-app.post('/api/save-shazam', (req, res) => {
-    const { title, artist } = req.body;
-    if (!title || !artist) {
-        return res.status(400).send({ status: "error", message: "חסר שם שיר או אמן." });
-    }
-
-    res.status(200).send({ status: "success", message: "מחפש בספוטיפיי ושומר..." });
-    saveShazamTrack(title, artist).catch(err => {
-        console.error("Background save-shazam processing failed:", err.message);
-    });
-});
-
-async function saveShazamTrack(title, artist) {
-    try {
-        const accessToken = await getSpotifyAccessToken();
-        // Reuses the existing two-stage fuzzy→strict search (with the same sanitization
-        // that strips embellishments Spotify's search chokes on) rather than a new raw
-        // search call — Shazam's title/artist strings can have the same kind of noise
-        // (parenthetical remixes/features) that this was already built to handle.
-        const track = await searchSpotifyTrack(accessToken, title, artist);
-
-        if (!track) {
-            console.log(`Shazam save: no Spotify match for "${title}" by ${artist}`);
-            await pushDashboardUpdate(`❌ לא מצאתי בספוטיפיי את "${title}" של ${artist} (זוהה ע"י Shazam).`);
-            return;
-        }
-
-        // Reuses the same save call already verified working in production, rather than a
-        // new raw PUT /v1/me/tracks — this app's Spotify app registration has previously
-        // shown endpoint-specific quirks (see saveTrackToLibrary's own note), so sticking to
-        // the one proven path is safer than introducing an untested parallel one.
-        await saveTrackToLibrary(accessToken, track.id);
-        await logInteraction('added', track.id, title, artist);
-        console.log(`Saved Shazam-identified track "${title}" by ${artist} to Liked Songs.`);
-        await pushDashboardUpdate(`✅ נשמר ל-Liked Songs (Shazam): ${title} - ${artist}`);
-    } catch (error) {
-        console.error("Save-shazam error:", error.response?.data || error.message);
-        await pushDashboardUpdate(`❌ הייתה תקלה בשמירת "${title}" (Shazam). בדוק טרמינל.`);
     }
 }
 
