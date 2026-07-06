@@ -1229,6 +1229,52 @@ async function saveCurrentlyPlayingTrack() {
     }
 }
 
+// "Shazam something playing in the background (e.g. from YouTube) and save it" — the
+// Shortcut already did the audio recognition, so this just resolves a known title/artist
+// to a real Spotify track and saves it. No Gemini/NLU involved, so — like /api/save-current
+// — this stays on the immediate-response pattern rather than the conversational one used
+// for lyrics (there's no ambiguity here to confirm; Shazam's answer is already specific).
+app.post('/api/save-shazam', (req, res) => {
+    const { title, artist } = req.body;
+    if (!title || !artist) {
+        return res.status(400).send({ status: "error", message: "חסר שם שיר או אמן." });
+    }
+
+    res.status(200).send({ status: "success", message: "מחפש בספוטיפיי ושומר..." });
+    saveShazamTrack(title, artist).catch(err => {
+        console.error("Background save-shazam processing failed:", err.message);
+    });
+});
+
+async function saveShazamTrack(title, artist) {
+    try {
+        const accessToken = await getSpotifyAccessToken();
+        // Reuses the existing two-stage fuzzy→strict search (with the same sanitization
+        // that strips embellishments Spotify's search chokes on) rather than a new raw
+        // search call — Shazam's title/artist strings can have the same kind of noise
+        // (parenthetical remixes/features) that this was already built to handle.
+        const track = await searchSpotifyTrack(accessToken, title, artist);
+
+        if (!track) {
+            console.log(`Shazam save: no Spotify match for "${title}" by ${artist}`);
+            await pushDashboardUpdate(`❌ לא מצאתי בספוטיפיי את "${title}" של ${artist} (זוהה ע"י Shazam).`);
+            return;
+        }
+
+        // Reuses the same save call already verified working in production, rather than a
+        // new raw PUT /v1/me/tracks — this app's Spotify app registration has previously
+        // shown endpoint-specific quirks (see saveTrackToLibrary's own note), so sticking to
+        // the one proven path is safer than introducing an untested parallel one.
+        await saveTrackToLibrary(accessToken, track.id);
+        await logInteraction('added', track.id, title, artist);
+        console.log(`Saved Shazam-identified track "${title}" by ${artist} to Liked Songs.`);
+        await pushDashboardUpdate(`✅ נשמר ל-Liked Songs (Shazam): ${title} - ${artist}`);
+    } catch (error) {
+        console.error("Save-shazam error:", error.response?.data || error.message);
+        await pushDashboardUpdate(`❌ הייתה תקלה בשמירת "${title}" (Shazam). בדוק טרמינל.`);
+    }
+}
+
 app.get('/login', (req, res) => {
     const scope = 'user-read-private user-read-email playlist-modify-public playlist-modify-private user-library-modify user-library-read user-modify-playback-state user-read-playback-state';
 
