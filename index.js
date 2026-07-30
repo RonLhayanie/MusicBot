@@ -1305,6 +1305,9 @@ app.get('/callback', async (req, res) => {
                      'Authorization': `Basic ${Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64')}`
                  }
              });
+             // Prints a long-lived Spotify refresh token to stdout. This is a one-time,
+             // run-it-locally setup step: copy the value into SPOTIFY_REFRESH_TOKEN in .env.
+             // Do not run this route on a host that ships stdout to a shared log aggregator.
              console.log("REFRESH_TOKEN:", response.data.refresh_token);
              res.send(`Success! Please copy the NEW refresh token from the terminal.`);
          } catch (error) {
