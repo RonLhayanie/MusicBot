@@ -1,2 +1,6 @@
 node_modules/
 .env
+
+# Local AI-assistant workflow files, not part of the project
+.claude/
+CLAUDE.md
