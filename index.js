@@ -1,3 +1,4 @@
+require('dns').setServers(['8.8.8.8', '1.1.1.1']);
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -23,6 +24,13 @@ const MONGO_URI = process.env.MONGO_URI;
 const TELEGRAM_OWNER_CHAT_ID = process.env.TELEGRAM_OWNER_CHAT_ID
     ? Number(process.env.TELEGRAM_OWNER_CHAT_ID)
     : null;
+// Playback is only ever sent to the Spotify device with this name (see getTargetDevice).
+const SPOTIFY_TARGET_DEVICE_NAME = process.env.SPOTIFY_TARGET_DEVICE_NAME?.trim();
+if (!SPOTIFY_TARGET_DEVICE_NAME) {
+    console.error("FATAL: SPOTIFY_TARGET_DEVICE_NAME is not set. Refusing to start.");
+    process.exit(1);
+}
+const DEVICE_NOT_FOUND_MSG = `הטלפון "${SPOTIFY_TARGET_DEVICE_NAME}" לא זמין כרגע. תפתח את ספוטיפיי בטלפון ונסה שוב.`;
 
 // polling/listening are only started once MongoDB connects successfully (see start() below) —
 // Railway's filesystem is ephemeral, so this app should not accept traffic without its DB
@@ -168,15 +176,22 @@ async function removeTrackFromLibrary(accessToken, trackId) {
     });
 }
 
-// Returns the user's currently active device, or the first available device
-// if none is marked active (e.g. Spotify is open but idle). Returns null if
-// no devices are available at all.
-async function getActiveDevice(accessToken) {
-    const response = await axios.get('https://api.spotify.com/v1/me/player/devices', {
-        headers: { 'Authorization': `Bearer ${accessToken}` }
-    });
-    const devices = response.data.devices || [];
-    return devices.find(d => d.is_active) || devices[0] || null;
+// Returns the device named SPOTIFY_TARGET_DEVICE_NAME (exact, case-insensitive), or null.
+// Never falls back to another device. A missing target is retried since the phone may not
+// have registered with Spotify yet; any other error (auth, network) propagates immediately.
+async function getTargetDevice(accessToken, retries = 2, delay = 1500) {
+    const wanted = SPOTIFY_TARGET_DEVICE_NAME.toLowerCase();
+    for (let i = 0; i <= retries; i++) {
+        const response = await axios.get('https://api.spotify.com/v1/me/player/devices', {
+            headers: { 'Authorization': `Bearer ${accessToken}` }
+        });
+        const device = (response.data.devices || []).find(d =>
+            !d.is_restricted && d.id && d.name.trim().toLowerCase() === wanted
+        );
+        if (device) return device;
+        if (i < retries) await new Promise(resolve => setTimeout(resolve, delay));
+    }
+    return null;
 }
 
 // Starts/resumes playback of a single track on the given device
@@ -217,16 +232,13 @@ async function resumePlaybackOnDevice(accessToken, deviceId) {
     });
 }
 
-// Single /me/player call returning both the active device and play state — Spotify's
-// response already has both, so callers needing both don't need two separate requests.
-async function getPlaybackState(accessToken) {
+// True only if the given device is the one currently playing. Another device (e.g. a TV)
+// playing counts as "not playing" here, so a toggle resumes on the target instead.
+async function isPlayingOnDevice(accessToken, deviceId) {
     const response = await axios.get('https://api.spotify.com/v1/me/player', {
         headers: { 'Authorization': `Bearer ${accessToken}` }
     }).catch(() => null);
-    return {
-        device: response?.data?.device ?? null,
-        isPlaying: Boolean(response?.data?.is_playing)
-    };
+    return response?.data?.device?.id === deviceId && Boolean(response.data.is_playing);
 }
 
 // Returns the full Spotify track object for whatever's currently playing, or null if
@@ -241,10 +253,10 @@ async function getCurrentlyPlayingTrack(accessToken) {
     return response.data.item;
 }
 
-// Finds an active device and plays a track there. Returns the device on success,
-// null if none is available (caller shows a graceful message).
+// Plays a track on the target device. Returns the device on success, null if the target
+// device is unavailable (caller shows DEVICE_NOT_FOUND_MSG).
 async function tryPlayTrack(accessToken, trackId) {
-    const device = await getActiveDevice(accessToken);
+    const device = await getTargetDevice(accessToken);
     if (!device) return null;
     await playTrackOnDevice(accessToken, trackId, device.id);
     console.log(`Now playing track ${trackId} on device: ${device.name}`);
@@ -381,7 +393,7 @@ async function advanceSession(accessToken) {
     const played = await tryPlayTrack(accessToken, nextTrack.trackId);
     return played
         ? `מנגן את "${nextTrack.title}" של ${nextTrack.artist}.`
-        : `לא מצאתי מכשיר ספוטיפיי פעיל להמשך הפלייליסט.`;
+        : DEVICE_NOT_FOUND_MSG;
 }
 
 // Caller (processSiriCommand) is responsible for pushing the returned text to Telegram —
@@ -760,7 +772,7 @@ bot.on('callback_query', async (query) => {
                 await logInteraction('played', trackId, info.name, artistNames);
                 bot.sendMessage(chatId, `▶️ מנגן את "${info.name}" על ${device.name}.`);
             } else {
-                bot.sendMessage(chatId, `❌ לא מצאתי מכשיר ספוטיפיי פעיל. תפתח את ספוטיפיי ונסה שוב.`);
+                bot.sendMessage(chatId, `❌ ${DEVICE_NOT_FOUND_MSG}`);
             }
         } catch (error) {
             console.error(`Spotify API error:`, error.response?.data || error.message);
@@ -776,11 +788,11 @@ bot.on('callback_query', async (query) => {
 
         try {
             const accessToken = await getSpotifyAccessToken();
-            const { device, isPlaying } = await getPlaybackState(accessToken);
+            const device = await getTargetDevice(accessToken);
             if (!device) {
-                bot.sendMessage(chatId, `❌ לא מצאתי מכשיר ספוטיפיי פעיל.`);
+                bot.sendMessage(chatId, `❌ ${DEVICE_NOT_FOUND_MSG}`);
             } else {
-                if (isPlaying) {
+                if (await isPlayingOnDevice(accessToken, device.id)) {
                     await pausePlaybackOnDevice(accessToken, device.id);
                     bot.sendMessage(chatId, `⏸ עצרתי את המוזיקה.`);
                 } else {
@@ -958,9 +970,9 @@ async function processSiriCommand(parsed) {
                     // "המשך"/"הפעל"/"נגן" said with no song/artist/genre named means
                     // resume playback, not search for a nonexistent song by that name
                     const accessToken = await getSpotifyAccessToken();
-                    const device = await getActiveDevice(accessToken);
+                    const device = await getTargetDevice(accessToken);
                     if (!device) {
-                        replyText = `לא מצאתי מכשיר ספוטיפיי פעיל.`;
+                        replyText = DEVICE_NOT_FOUND_MSG;
                         break;
                     }
                     await resumePlaybackOnDevice(accessToken, device.id);
@@ -995,14 +1007,14 @@ async function processSiriCommand(parsed) {
                 }
                 replyText = played
                     ? `מפעיל עכשיו את "${match.title}" של ${match.artist}.`
-                    : `לא מצאתי מכשיר ספוטיפיי פעיל. תפתח את ספוטיפיי במכשיר ונסה שוב.`;
+                    : DEVICE_NOT_FOUND_MSG;
                 break;
             }
             case "pause": {
                 const accessToken = await getSpotifyAccessToken();
-                const device = await getActiveDevice(accessToken);
+                const device = await getTargetDevice(accessToken);
                 if (!device) {
-                    replyText = `לא מצאתי מכשיר ספוטיפיי פעיל.`;
+                    replyText = DEVICE_NOT_FOUND_MSG;
                     break;
                 }
                 await pausePlaybackOnDevice(accessToken, device.id);
@@ -1011,9 +1023,9 @@ async function processSiriCommand(parsed) {
             }
             case "next": {
                 const accessToken = await getSpotifyAccessToken();
-                const device = await getActiveDevice(accessToken);
+                const device = await getTargetDevice(accessToken);
                 if (!device) {
-                    replyText = `לא מצאתי מכשיר ספוטיפיי פעיל.`;
+                    replyText = DEVICE_NOT_FOUND_MSG;
                     break;
                 }
                 await skipToNextOnDevice(accessToken, device.id);
@@ -1082,7 +1094,7 @@ async function processSiriCommand(parsed) {
                 }
                 replyText = device
                     ? `יצרתי פלייליסט ומתחיל לנגן את "${tracks[0].title}" של ${tracks[0].artist}. תגיד "הוסף" או "דלג" בזמן הנסיעה.`
-                    : `יצרתי את הפלייליסט אבל לא מצאתי מכשיר ספוטיפיי פעיל.`;
+                    : `יצרתי את הפלייליסט אבל לא ניגנתי כלום. ${DEVICE_NOT_FOUND_MSG}`;
                 break;
             }
             default:
@@ -1175,7 +1187,7 @@ async function handleLyricsConfirmation(req, res) {
         const accessToken = await getSpotifyAccessToken();
         const device = await tryPlayTrack(accessToken, trackId);
         if (!device) {
-            return res.status(200).send({ speech: "לא מצאתי מכשיר ספוטיפיי פעיל.", listen: false });
+            return res.status(200).send({ speech: DEVICE_NOT_FOUND_MSG, listen: false });
         }
 
         if (currentSession) {
