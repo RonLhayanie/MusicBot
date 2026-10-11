@@ -223,6 +223,58 @@ async function skipToNextOnDevice(accessToken, deviceId) {
     });
 }
 
+// Starts playback of an ordered list of track URIs on the given device
+async function playUrisOnDevice(accessToken, uris, deviceId) {
+    await axios({
+        method: 'put',
+        url: `https://api.spotify.com/v1/me/player/play?device_id=${deviceId}`,
+        data: { uris },
+        headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/json'
+        }
+    });
+}
+
+// In-place Fisher-Yates shuffle
+function shuffleInPlace(items) {
+    for (let i = items.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [items[i], items[j]] = [items[j], items[i]];
+    }
+    return items;
+}
+
+// Returns up to `cap` shuffled track URIs from the user's Liked Songs (empty array if none).
+// The first call (limit=1) doubles as a probe of GET /me/tracks and yields the library
+// size; any failure propagates untouched so the caller can log the raw Spotify error body.
+// Spotify documents no maximum for `uris` in /me/player/play, hence the conservative cap.
+// Libraries bigger than the cap are sampled from random pages, not just the newest saves.
+async function getLikedTrackUris(accessToken, cap = 100) {
+    const PAGE_SIZE = 50;
+    const headers = { 'Authorization': `Bearer ${accessToken}` };
+
+    const probe = await axios.get('https://api.spotify.com/v1/me/tracks?limit=1', { headers });
+    const total = probe.data.total;
+    if (!total) return [];
+
+    const pageCount = Math.ceil(total / PAGE_SIZE);
+    const pagesWanted = Math.ceil(cap / PAGE_SIZE);
+    const pages = shuffleInPlace(Array.from({ length: pageCount }, (_, i) => i)).slice(0, pagesWanted);
+
+    const responses = await Promise.all(pages.map(page =>
+        axios.get(`https://api.spotify.com/v1/me/tracks?limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}`, { headers })
+    ));
+
+    const uris = responses
+        .flatMap(r => r.data.items)
+        .map(item => item.track)
+        .filter(track => track && track.uri && !track.is_local && track.is_playable !== false)
+        .map(track => track.uri);
+
+    return shuffleInPlace(uris).slice(0, cap);
+}
+
 // Resumes whatever was paused, unlike playTrackOnDevice which always starts a specific track
 async function resumePlaybackOnDevice(accessToken, deviceId) {
     await axios({
@@ -424,7 +476,15 @@ async function parseSiriCommand(voiceCommand) {
         - "add_to_library" (user wants to save the current song or a specific song)
         - "search_lyrics" (user is reciting song lyrics to find a song)
         - "playlist" (user wants to add to or create a playlist)
+        - "play_liked" (user wants to play their OWN saved/liked songs library)
         - "unknown"
+
+        CRITICAL — LIKED SONGS: when the user refers to their own saved or liked songs
+        (e.g. "תנגן את השירים שאהבתי", "תפעיל את הלייקים שלי", "נגן את השירים השמורים
+        שלי") the intent is "play_liked" with search_query "". This takes priority over
+        "play" and "playlist", even if the word "פלייליסט" appears, because nothing needs
+        to be searched or created — the songs already exist in the user's library. Use
+        "playlist" only for a NEW themed list the user describes (genre, mood, artist).
 
         CRITICAL — PLAYBACK CONTROL WORDS: short commands like these are direct player
         controls, NOT song titles to search for. NEVER put these words themselves into
@@ -446,7 +506,7 @@ async function parseSiriCommand(voiceCommand) {
 
         Return ONLY a valid JSON in this exact format (no markdown):
         {
-            "intent": "play|pause|next|add_to_library|search_lyrics|playlist|unknown",
+            "intent": "play|pause|next|add_to_library|search_lyrics|playlist|play_liked|unknown",
             "search_query": "song title + artist (or artist/genre name) to search on Spotify for every intent EXCEPT search_lyrics, where this must be the raw recited lyrics. Never a playback-control word. Empty string if not applicable."
         }`;
         const result = await model.generateContent(prompt);
@@ -1095,6 +1155,43 @@ async function processSiriCommand(parsed) {
                 replyText = device
                     ? `יצרתי פלייליסט ומתחיל לנגן את "${tracks[0].title}" של ${tracks[0].artist}. תגיד "הוסף" או "דלג" בזמן הנסיעה.`
                     : `יצרתי את הפלייליסט אבל לא ניגנתי כלום. ${DEVICE_NOT_FOUND_MSG}`;
+                break;
+            }
+            case "play_liked": {
+                const accessToken = await getSpotifyAccessToken();
+                const device = await getTargetDevice(accessToken);
+                if (!device) {
+                    replyText = DEVICE_NOT_FOUND_MSG;
+                    break;
+                }
+
+                let uris;
+                try {
+                    uris = await getLikedTrackUris(accessToken);
+                } catch (err) {
+                    // Selective handling: a rate limit gets a clear message (no blind retry);
+                    // anything else, including a failed /me/tracks probe, goes to the outer
+                    // catch, which logs the raw Spotify error body.
+                    if (err.response?.status === 429) {
+                        const wait = err.response.headers['retry-after'];
+                        replyText = `ספוטיפיי מגביל בקשות כרגע. נסה שוב${wait ? ` בעוד ${wait} שניות` : ' עוד מעט'}.`;
+                        break;
+                    }
+                    throw err;
+                }
+
+                if (uris.length === 0) {
+                    replyText = `אין לך עדיין שירים ב-Liked Songs.`;
+                    break;
+                }
+
+                await playUrisOnDevice(accessToken, uris, device.id);
+                if (currentSession) {
+                    console.log("Ending driving session: playing Liked Songs changed what's playing.");
+                    currentSession = null;
+                }
+                console.log(`Now playing ${uris.length} Liked Songs on device: ${device.name}`);
+                replyText = `מנגן ${uris.length} שירים מה-Liked Songs שלך.`;
                 break;
             }
             default:
