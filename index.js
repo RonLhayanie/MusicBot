@@ -236,6 +236,43 @@ async function playUrisOnDevice(accessToken, uris, deviceId) {
     });
 }
 
+// Repeat is a player-level setting that survives new play calls, so a phone left on
+// repeat-track would loop whatever we start. Must be awaited before the play call, since
+// Spotify does not guarantee ordering between concurrent player requests.
+async function setRepeatOffOnDevice(accessToken, deviceId) {
+    await axios({
+        method: 'put',
+        url: `https://api.spotify.com/v1/me/player/repeat?state=off&device_id=${deviceId}`,
+        headers: { 'Authorization': `Bearer ${accessToken}` }
+    });
+}
+
+// Shuffle is also a player-level setting that survives new play calls; with it on, Spotify
+// may start a uris list from any position. Same ordering rule as repeat: await before play.
+async function setShuffleOffOnDevice(accessToken, deviceId) {
+    await axios({
+        method: 'put',
+        url: `https://api.spotify.com/v1/me/player/shuffle?state=false&device_id=${deviceId}`,
+        headers: { 'Authorization': `Bearer ${accessToken}` }
+    });
+}
+
+// Diagnostic only: logs what the player actually reports shortly after a play call, so
+// queue-order problems can be traced to shuffle/repeat state or the track that really started.
+// Never throws; callers do not await it.
+async function logPlaybackState(accessToken) {
+    try {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        const response = await axios.get('https://api.spotify.com/v1/me/player', {
+            headers: { 'Authorization': `Bearer ${accessToken}` }
+        });
+        const state = response.data;
+        console.log(`Player state: shuffle=${state.shuffle_state} repeat=${state.repeat_state} is_playing=${state.is_playing} current="${state.item?.name}" (${state.item?.uri})`);
+    } catch (err) {
+        console.error("Failed to read player state:", err.response?.data || err.message);
+    }
+}
+
 // In-place Fisher-Yates shuffle
 function shuffleInPlace(items) {
     for (let i = items.length - 1; i > 0; i--) {
@@ -469,13 +506,15 @@ async function parseSiriCommand(voiceCommand) {
         User's voice command: "${voiceCommand}"
 
         Classify the intent into one of these categories:
-        - "play" (user wants to play a specific artist, song, or genre, OR wants to
-          resume/continue playback with no specific song named)
+        - "play" (user wants to play a specific artist, song, genre, era or decade, mood,
+          or language/country style, OR wants to resume/continue playback with no
+          specific song named)
         - "pause" (user wants to stop/pause music)
         - "next" (user wants to skip to the next track)
         - "add_to_library" (user wants to save the current song or a specific song)
         - "search_lyrics" (user is reciting song lyrics to find a song)
-        - "playlist" (user wants to add to or create a playlist)
+        - "playlist" (user EXPLICITLY asks to create, make, build, or add to a playlist,
+          e.g. "make me a playlist", "תיצור לי פלייליסט", "תוסיף לפלייליסט")
         - "play_liked" (user wants to play their OWN saved/liked songs library)
         - "unknown"
 
@@ -484,7 +523,9 @@ async function parseSiriCommand(voiceCommand) {
         שלי") the intent is "play_liked" with search_query "". This takes priority over
         "play" and "playlist", even if the word "פלייליסט" appears, because nothing needs
         to be searched or created — the songs already exist in the user's library. Use
-        "playlist" only for a NEW themed list the user describes (genre, mood, artist).
+        "playlist" ONLY when the user explicitly asks to create, make, build, or add to a
+        playlist. A request to simply play songs of an era, decade, genre, mood, language,
+        or artist is "play", even if it sounds like a themed list.
 
         CRITICAL — PLAYBACK CONTROL WORDS: short commands like these are direct player
         controls, NOT song titles to search for. NEVER put these words themselves into
@@ -494,8 +535,8 @@ async function parseSiriCommand(voiceCommand) {
         - "המשך", "הפעל", "נגן", "תנגן" said ALONE with no specific song/artist/genre
           named → intent "play", search_query "" (this means resume/continue playback,
           not search for a song literally called "הפעל")
-        Only use intent "play" WITH a non-empty search_query when the user actually names
-        a specific song, artist, or genre to play.
+        Use intent "play" WITH a non-empty search_query when the user names a specific
+        song, artist, or any style: genre, era, decade, mood, or language.
 
         For "search_lyrics": set search_query to the raw recited lyrics text exactly as
         spoken — do NOT try to identify the song here. A dedicated, search-grounded
@@ -507,7 +548,7 @@ async function parseSiriCommand(voiceCommand) {
         Return ONLY a valid JSON in this exact format (no markdown):
         {
             "intent": "play|pause|next|add_to_library|search_lyrics|playlist|play_liked|unknown",
-            "search_query": "song title + artist (or artist/genre name) to search on Spotify for every intent EXCEPT search_lyrics, where this must be the raw recited lyrics. Never a playback-control word. Empty string if not applicable."
+            "search_query": "song title + artist (or artist/genre name) to search on Spotify for every intent EXCEPT search_lyrics, where this must be the raw recited lyrics. For era, genre, or mood requests, the request in the user's own words (e.g. songs from the 60s). Never a playback-control word. Empty string if not applicable."
         }`;
         const result = await model.generateContent(prompt);
         const response = await result.response;
@@ -542,7 +583,9 @@ async function callGeminiForSongs(prompt, retries = 3, delay = 2000) {
             let text = response.text();
 
             text = text.replace(/```json/g, '').replace(/```/g, '').trim();
-            return { songs: JSON.parse(text).songs };
+            const parsed = JSON.parse(text);
+            // `kind` is optional and only set by prompts that ask for it; other callers ignore it
+            return { songs: parsed.songs, kind: parsed.kind };
         } catch (error) {
             const isQuotaExhausted = /RESOURCE_EXHAUSTED|quota/i.test(error.message || "");
 
@@ -593,6 +636,109 @@ async function researchMusic(userInput) {
     DO NOT ADD ANY OTHER TEXT OR MARKDOWN, JUST THE JSON.`;
 
     return callGeminiForSongs(prompt);
+}
+
+// Voice "play X" lookup. Three modes, reported back in `kind`:
+//   "song"   - the requested song first, then similar songs, so a single exact title still
+//              produces a playable list
+//   "artist" - 8 well-known songs by the named artist only, nobody else
+//   "style"  - an era, genre, language or mood with no song or artist named: 8 varied
+//              songs by different artists, no required first song
+// Separate from researchMusic on purpose, whose "up to 5, discovery-style" contract also
+// serves the Telegram and playlist flows. Asks for 8 total since some will not resolve on
+// Spotify's search and get dropped.
+async function researchSimilarPlaylist(userInput) {
+    const prompt = `You are an elite music curator building a short listening queue.
+    The user asked to play: "${userInput}".
+
+    FIRST decide the request type. Be strict:
+    - "song": the request contains ANY song title, even together with an artist name, even in forms like "<title> by <artist>" or "<artist> - <title>" (e.g., "Beshaot Habodedot by Itay Levi", "Itay Levi - Beshaot Habodedot", "Mema At Mefahedet").
+    - "artist": ONLY when the request names an artist or band and contains NO song title at all (e.g., "songs by Eyal Golan", "Eyal Golan songs", "play Arik Einstein").
+    - "style": the request names NEITHER a song nor an artist. It describes an era, decade, genre, language or country, mood, or activity (e.g., "songs from the 60s", "old Israeli songs", "calm driving music", "Mizrahi party hits").
+    If you are unsure between "song" and "artist", choose "song". If the request names no song and no artist, choose "style".
+
+    QUEUE RULES:
+    1. If the type is "artist": return 8 well-known songs by THAT artist only. Every song must be by that exact artist. Do NOT include songs by any other artist, and do not repeat a song.
+    2. If the type is "song": the FIRST song must be the song the user asked for, then add 7 other songs similar to it in style, era, and language. If the first song is in Hebrew, the others must be Hebrew too. Among those 7 songs, at least 4 must be by DIFFERENT artists (different from each other). More songs by the requested artist are allowed, but make the list varied rather than one artist's catalog. Do not repeat the first song or the same song twice.
+    3. If the type is "style": return 8 varied songs that fit the request well, each by a DIFFERENT artist wherever possible. There is no required first song. Pick well-known, representative songs of that era, genre, language, or mood. Do not repeat a song.
+    4. USE GOOGLE SEARCH to verify exact track names and artists.
+    5. NEVER invent, hallucinate, guess, or translate song titles.
+    6. ONLY return REAL, officially released songs that exist on Spotify.
+    7. Return the EXACT official track and artist name exactly as released on Spotify, in their original native language and script (e.g., Hebrew for Israeli songs). NEVER add English translations, transliterations, or parenthetical annotations. Spotify's search fails on these embellishments.
+    8. Prefer the best-known songs: the biggest hits and most-streamed songs of that artist, era, or style, not obscure album tracks. Avoid live, remix, karaoke, and cover versions.
+    9. Order the songs from most famous to least famous. For type "song", the requested song stays FIRST and the others follow in that order.
+
+    If the request is a general greeting or NOT related to music, return EXACTLY: {"songs": []}
+
+    You MUST return ONLY a valid JSON object.
+    Even if the request fits no category cleanly, you MUST still answer with the JSON object. Never answer in prose.
+    The JSON must have a key 'kind' with the value "artist", "song", or "style", and a key 'songs' containing an array of up to 8 objects (for type "song", the requested song first).
+    Each song object MUST have exactly two keys: 'title' (the exact song name) and 'artist' (the exact artist name).
+    DO NOT ADD ANY OTHER TEXT OR MARKDOWN, JUST THE JSON.`;
+
+    return callGeminiForSongs(prompt);
+}
+
+// Artist-mode guard for the voice "play" intent. Returns true only on a CLEAR mismatch:
+// the track shares no artist ID with the anchor (the first resolved track), and no Spotify
+// artist name matches the researched artist after normalizing. When the two names are in
+// different scripts (Hebrew vs Latin, i.e. a possible transliteration) they cannot be
+// compared, so that counts as unknown and the track is kept.
+function isClearArtistMismatch(researchedArtist, track, anchorIds) {
+    if (track.artists.some(a => anchorIds.has(a.id))) return false;
+
+    const norm = s => String(s).normalize('NFKD')
+        .replace(/[̀-֑ͯ-ׇ]/g, '')
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}\s]/gu, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const scriptOf = s => /[֐-׿]/.test(s) ? 'hebrew' : /[a-z]/.test(s) ? 'latin' : 'other';
+
+    const wanted = norm(researchedArtist);
+    if (!wanted) return false;
+
+    return !track.artists.some(a => {
+        const name = norm(a.name);
+        if (!name) return false;
+        if (scriptOf(name) !== scriptOf(wanted)) return true;
+        return name === wanted || name.includes(wanted) || wanted.includes(name);
+    });
+}
+
+// Song-mode variety for the voice "play" intent: reorders everything after the first item so
+// that, where avoidable, no two consecutive tracks share a Spotify artist ID (a guest
+// feature counts as sharing). The first item stays first and nothing is dropped. Greedy:
+// at each step, among the tracks that do not clash with the previous one, take the one whose
+// artist has the most tracks still waiting (so one artist is not stranded as a run at the
+// end), ties broken by original order. If every remaining track clashes, take the next one
+// in original order. Items are { track, ... } with track.artists from Spotify.
+function interleaveByArtist(items) {
+    if (items.length < 3) return items;
+
+    const idsOf = item => item.track.artists.map(a => a.id);
+    const remaining = items.slice(1);
+    const result = [items[0]];
+
+    while (remaining.length > 0) {
+        const lastIds = new Set(idsOf(result[result.length - 1]));
+        const waiting = id => remaining.filter(r => idsOf(r).includes(id)).length;
+
+        let bestIndex = -1;
+        let bestScore = -1;
+        remaining.forEach((item, i) => {
+            const ids = idsOf(item);
+            if (ids.some(id => lastIds.has(id))) return;
+            const score = Math.max(0, ...ids.map(waiting));
+            if (score > bestScore) {
+                bestIndex = i;
+                bestScore = score;
+            }
+        });
+
+        result.push(remaining.splice(bestIndex === -1 ? 0 : bestIndex, 1)[0]);
+    }
+    return result;
 }
 
 // Suggests new tracks in the same vibe as the user's recently liked tracks. Asks for
@@ -1007,10 +1153,16 @@ async function processSiriCommand(parsed) {
     // handleLyricsSearch before this function is ever called.)
     const needsLookup = ["play", "add_to_library"].includes(parsed.intent);
     let match = null;
+    let researchedSongs = [];
+    let researchedKind = null;
 
     if (needsLookup && parsed.search_query) {
-        const result = await researchMusic(parsed.search_query);
+        const result = parsed.intent === "play"
+            ? await researchSimilarPlaylist(parsed.search_query)
+            : await researchMusic(parsed.search_query);
         if (result.songs && result.songs.length > 0) {
+            researchedSongs = result.songs;
+            researchedKind = result.kind;
             match = result.songs[0];
         }
     }
@@ -1044,30 +1196,99 @@ async function processSiriCommand(parsed) {
                     break;
                 }
                 const accessToken = await getSpotifyAccessToken();
-                const track = await searchSpotifyTrack(accessToken, match.title, match.artist);
-                if (!track) {
+
+                // Resolve every researched song concurrently (order is preserved by
+                // Promise.all) and drop the ones Spotify can't find. The first researched
+                // song is the one the user asked for, so if it does not resolve we report
+                // it as not found instead of playing a similar song in its place.
+                const resolved = await Promise.all(
+                    researchedSongs.map(song => searchSpotifyTrack(accessToken, song.title, song.artist).catch(() => null))
+                );
+
+                // Artist requests should contain only that artist: searchSpotifyTrack can fall
+                // back to a different artist's track. The first song is never dropped here
+                // (it is the anchor), so this can neither empty the list nor turn an
+                // available song into a "not found".
+                if (researchedKind === "artist" && resolved[0]) {
+                    const anchorIds = new Set(resolved[0].artists.map(a => a.id));
+                    resolved.forEach((track, i) => {
+                        if (i > 0 && track && isClearArtistMismatch(researchedSongs[i].artist, track, anchorIds)) {
+                            console.log(`Dropping "${researchedSongs[i].title}": Spotify artists [${track.artists.map(a => a.name).join(', ')}] do not match "${researchedSongs[i].artist}" or the first track's artist.`);
+                            resolved[i] = null;
+                        }
+                    });
+                }
+
+                // Style requests name no song, so any resolved track may lead and the reply
+                // must not name one; song/artist requests still need their first song.
+                if (researchedKind === "style") {
+                    if (!resolved.some(Boolean)) {
+                        replyText = `לא מצאתי שירים זמינים בספוטיפיי עבור "${parsed.search_query}".`;
+                        break;
+                    }
+                } else if (!resolved[0]) {
                     replyText = `מצאתי את "${match.title}" של ${match.artist}, אבל הוא לא זמין בספוטיפיי.`;
                     break;
                 }
-                const played = await tryPlayTrack(accessToken, track.id);
-                if (played) {
-                    if (currentSession) {
-                        // A direct "play" while a driving session is active means the
-                        // session's bookkeeping no longer matches what's actually playing —
-                        // end it rather than let a later "add"/"skip" act on a stale track.
-                        console.log("Ending driving session: a direct play command changed what's playing.");
-                        currentSession = null;
-                    }
-                    await logInteraction('played', track.id, match.title, match.artist);
-                    const chatId = await getDashboardChatId();
-                    if (chatId) {
-                        sendTrackCard(chatId, track, match.title, match.artist);
-                        notified = true;
-                    }
+
+                // Dedupe by URI, keeping the first occurrence so order is preserved
+                const seenUris = new Set();
+                let playable = researchedSongs
+                    .map((song, i) => resolved[i] && { track: resolved[i], title: song.title, artist: song.artist })
+                    .filter(Boolean)
+                    .filter(p => !seenUris.has(p.track.uri) && seenUris.add(p.track.uri));
+
+                // Song and style modes: spread repeated artists apart (first track stays first,
+                // nothing is dropped). Artist mode is deliberately all one artist.
+                let reordered = false;
+                if (researchedKind !== "artist") {
+                    const before = playable.map(p => p.track.uri).join();
+                    playable = interleaveByArtist(playable);
+                    reordered = playable.map(p => p.track.uri).join() !== before;
                 }
-                replyText = played
-                    ? `מפעיל עכשיו את "${match.title}" של ${match.artist}.`
-                    : DEVICE_NOT_FOUND_MSG;
+
+                const device = await getTargetDevice(accessToken);
+                if (!device) {
+                    replyText = DEVICE_NOT_FOUND_MSG;
+                    break;
+                }
+
+                try {
+                    await setRepeatOffOnDevice(accessToken, device.id);
+                } catch (err) {
+                    console.error("Failed to turn repeat off, playing anyway:", err.response?.data || err.message);
+                }
+                try {
+                    await setShuffleOffOnDevice(accessToken, device.id);
+                } catch (err) {
+                    console.error("Failed to turn shuffle off, playing anyway:", err.response?.data || err.message);
+                }
+
+                const uris = playable.map(p => p.track.uri);
+                const followerArtists = new Set(playable.slice(1).map(p => p.track.artists[0]?.id));
+                console.log(`Sending ${uris.length} tracks to Spotify (kind: ${researchedKind || 'unknown'}, ${reordered ? 'reordered by artist' : 'order unchanged'}, ${followerArtists.size} distinct artists after the first), in order:`);
+                playable.forEach((p, i) => console.log(`  ${i + 1}. ${p.title} - ${p.track.artists.map(a => a.name).join(', ')} (${p.track.uri})`));
+
+                await playUrisOnDevice(accessToken, uris, device.id);
+                console.log(`Now playing ${playable.length} tracks on device: ${device.name}`);
+                logPlaybackState(accessToken);
+
+                if (currentSession) {
+                    // A direct "play" while a driving session is active means the
+                    // session's bookkeeping no longer matches what's actually playing —
+                    // end it rather than let a later "add"/"skip" act on a stale track.
+                    console.log("Ending driving session: a direct play command changed what's playing.");
+                    currentSession = null;
+                }
+
+                const first = playable[0];
+                await logInteraction('played', first.track.id, first.title, first.artist);
+                const chatId = await getDashboardChatId();
+                if (chatId) {
+                    sendTrackCard(chatId, first.track, first.title, first.artist);
+                    notified = true;
+                }
+                replyText = `מפעיל עכשיו את "${first.title}" של ${first.artist}, ואחריו עוד ${playable.length - 1} שירים.`;
                 break;
             }
             case "pause": {
